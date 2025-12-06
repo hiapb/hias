@@ -135,8 +135,8 @@ add_entry(){
   fi
   read -p "SS 密码: " SS_PASS
   if [ -z "$SS_PASS" ]; then echo "密码不能为空"; return; fi
-  read -p "SS 加密方式(默认 chacha20-ietf-poly1305): " SS_METHOD
-  SS_METHOD=${SS_METHOD:-chacha20-ietf-poly1305}
+  read -p "SS 加密方式(默认 aes-256-gcm): " SS_METHOD
+  SS_METHOD=${SS_METHOD:-aes-256-gcm}
   read -p "S5 地址: " S5_SERVER
   read -p "S5 端口: " S5_PORT
   read -p "S5 是否需要认证?(y/n): " A
