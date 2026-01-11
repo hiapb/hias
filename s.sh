@@ -279,10 +279,10 @@ main_menu(){
     echo
     echo "===== 📎SS 管理菜单 ====="
     echo "1) 安装"
-    echo "2) 查看所有映射"
-    echo "3) 添加 SS（直连）"
+    echo "2) 查看所有SS"
+    echo "3) 添加 SS"
     echo "4) 添加 SS -> S5"
-    echo "5) 删除映射"
+    echo "5) 删除SS"
     echo "6) 查看服务状态"
     echo "7) 查看日志"
     echo "8) 卸载"
