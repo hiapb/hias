@@ -152,7 +152,7 @@ add_ss_only(){
   read -p "SS 端口: " SS_PORT
   [ -z "$SS_PORT" ] && { echo "端口不能为空"; return; }
   if grep -q "|${SS_PORT}|" "$DB_FILE"; then
-    echo "该端口已存在映射"
+    echo "该端口已存在"
     return
   fi
   read -p "SS 密码: " SS_PASS
