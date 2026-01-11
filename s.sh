@@ -36,10 +36,13 @@ install_sing_box(){
   chmod +x "$SBOX_BIN"
 }
 
-# 规则：DB 每行格式
+# DB 每行格式：
 # ID|SS_PORT|SS_METHOD|SS_PASS|S5_SERVER|S5_PORT|S5_USER|S5_PASS
-# 若 S5_SERVER 为 "-" 表示 SS 直连（不走 S5）
+# S5_SERVER 为 "-" 表示 SS 直连（不走 S5）
 gen_config(){
+  local ID DB_SS_PORT DB_SS_METHOD DB_SS_PASS DB_S5_SERVER DB_S5_PORT DB_S5_USER DB_S5_PASS
+  local first
+
   if [ ! -s "$DB_FILE" ]; then
     cat > "$CONFIG_FILE" <<EOF
 {"log":{"level":"info","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct","rules":[]}}
@@ -50,38 +53,35 @@ EOF
   {
     echo -n '{"log":{"level":"info","timestamp":true},"inbounds":['
     first=1
-    while IFS='|' read -r ID SS_PORT SS_METHOD SS_PASS S5_SERVER S5_PORT S5_USER S5_PASS; do
+    while IFS='|' read -r ID DB_SS_PORT DB_SS_METHOD DB_SS_PASS DB_S5_SERVER DB_S5_PORT DB_S5_USER DB_S5_PASS; do
       [ -z "$ID" ] && continue
       if [ $first -eq 0 ]; then echo -n ','; fi
       first=0
-      echo -n '{"type":"shadowsocks","tag":"ss-'"$ID"'","listen":"::","listen_port":'"$SS_PORT"',"method":"'"$SS_METHOD"'","password":"'"$SS_PASS"'"}'
+      echo -n '{"type":"shadowsocks","tag":"ss-'"$ID"'","listen":"::","listen_port":'"$DB_SS_PORT"',"method":"'"$DB_SS_METHOD"'","password":"'"$DB_SS_PASS"'"}'
     done < "$DB_FILE"
 
     echo -n '],"outbounds":['
-    # 只有有 S5_SERVER 的才生成 socks outbound
     first=1
-    while IFS='|' read -r ID SS_PORT SS_METHOD SS_PASS S5_SERVER S5_PORT S5_USER S5_PASS; do
+    while IFS='|' read -r ID DB_SS_PORT DB_SS_METHOD DB_SS_PASS DB_S5_SERVER DB_S5_PORT DB_S5_USER DB_S5_PASS; do
       [ -z "$ID" ] && continue
-      [ "$S5_SERVER" = "-" ] && continue
+      [ "$DB_S5_SERVER" = "-" ] && continue
       if [ $first -eq 0 ]; then echo -n ','; fi
       first=0
-      if [ "$S5_USER" != "-" ]; then
-        echo -n '{"type":"socks","server":"'"$S5_SERVER"'","server_port":'"$S5_PORT"',"username":"'"$S5_USER"'","password":"'"$S5_PASS"'","tag":"s5-'"$ID"'"}'
+      if [ "$DB_S5_USER" != "-" ]; then
+        echo -n '{"type":"socks","server":"'"$DB_S5_SERVER"'","server_port":'"$DB_S5_PORT"',"username":"'"$DB_S5_USER"'","password":"'"$DB_S5_PASS"'","tag":"s5-'"$ID"'"}'
       else
-        echo -n '{"type":"socks","server":"'"$S5_SERVER"'","server_port":'"$S5_PORT"'","tag":"s5-'"$ID"'"}'
+        echo -n '{"type":"socks","server":"'"$DB_S5_SERVER"'","server_port":'"$DB_S5_PORT"'","tag":"s5-'"$ID"'"}'
       fi
     done < "$DB_FILE"
 
-    # 永远追加 direct
     if [ $first -eq 0 ]; then echo -n ','; fi
     echo -n '{"type":"direct","tag":"direct"}],'
 
-    # route：只有有 S5 的才加规则；其他 inbound 自动 final=direct
     echo -n '"route":{"final":"direct","rules":['
     first=1
-    while IFS='|' read -r ID SS_PORT SS_METHOD SS_PASS S5_SERVER S5_PORT S5_USER S5_PASS; do
+    while IFS='|' read -r ID DB_SS_PORT DB_SS_METHOD DB_SS_PASS DB_S5_SERVER DB_S5_PORT DB_S5_USER DB_S5_PASS; do
       [ -z "$ID" ] && continue
-      [ "$S5_SERVER" = "-" ] && continue
+      [ "$DB_S5_SERVER" = "-" ] && continue
       if [ $first -eq 0 ]; then echo -n ','; fi
       first=0
       echo -n '{"inbound":["ss-'"$ID"'"],"outbound":"s5-'"$ID"'"}'
@@ -167,30 +167,36 @@ add_ss_only(){
   fi
 
   echo "${NEW_ID}|${SS_PORT}|${SS_METHOD}|${SS_PASS}|-|0|-|-" >> "$DB_FILE"
+
+  SHOW_PORT="$SS_PORT"
+  SHOW_PASS="$SS_PASS"
+  SHOW_METHOD="$SS_METHOD"
+
   gen_config
   create_service
 
   IP=$(hostname -I | awk '{print $1}')
   echo "已添加（直连），客户端配置："
   echo "服务器: ${IP}"
-  echo "端口: ${SS_PORT}"
-  echo "密码: ${SS_PASS}"
-  echo "加密: ${SS_METHOD}"
+  echo "端口: ${SHOW_PORT}"
+  echo "密码: ${SHOW_PASS}"
+  echo "加密: ${SHOW_METHOD}"
 }
 
 add_entry(){
   check_ready || return
   echo "添加 SS -> S5 映射"
   read -p "SS 端口: " SS_PORT
-  if [ -z "$SS_PORT" ]; then echo "端口不能为空"; return; fi
+  [ -z "$SS_PORT" ] && { echo "端口不能为空"; return; }
   if grep -q "|${SS_PORT}|" "$DB_FILE"; then
     echo "该端口已存在映射"
     return
   fi
   read -p "SS 密码: " SS_PASS
-  if [ -z "$SS_PASS" ]; then echo "密码不能为空"; return; fi
+  [ -z "$SS_PASS" ] && { echo "密码不能为空"; return; }
   read -p "SS 加密方式(默认 aes-256-gcm): " SS_METHOD
   SS_METHOD=${SS_METHOD:-aes-256-gcm}
+
   read -p "S5 地址: " S5_SERVER
   read -p "S5 端口: " S5_PORT
   read -p "S5 是否需要认证?(y/n): " A
@@ -200,20 +206,28 @@ add_entry(){
     read -p "S5 用户: " S5_USER
     read -p "S5 密码: " S5_PASSW
   fi
+
   if [ ! -s "$DB_FILE" ]; then
     NEW_ID=1
   else
     NEW_ID=$(( $(awk -F'|' 'BEGIN{m=0}{if($1>m)m=$1}END{print m}' "$DB_FILE") + 1 ))
   fi
+
   echo "${NEW_ID}|${SS_PORT}|${SS_METHOD}|${SS_PASS}|${S5_SERVER}|${S5_PORT}|${S5_USER}|${S5_PASSW}" >> "$DB_FILE"
+
+  SHOW_PORT="$SS_PORT"
+  SHOW_PASS="$SS_PASS"
+  SHOW_METHOD="$SS_METHOD"
+
   gen_config
   create_service
+
   IP=$(hostname -I | awk '{print $1}')
   echo "已添加（走S5），客户端配置："
   echo "服务器: ${IP}"
-  echo "端口: ${SS_PORT}"
-  echo "密码: ${SS_PASS}"
-  echo "加密: ${SS_METHOD}"
+  echo "端口: ${SHOW_PORT}"
+  echo "密码: ${SHOW_PASS}"
+  echo "加密: ${SHOW_METHOD}"
 }
 
 delete_entry(){
@@ -266,7 +280,7 @@ main_menu(){
     echo "===== 📎SS 管理菜单 ====="
     echo "1) 安装"
     echo "2) 查看所有映射"
-    echo "3) 添加 SS"
+    echo "3) 添加 SS（直连）"
     echo "4) 添加 SS -> S5"
     echo "5) 删除映射"
     echo "6) 查看服务状态"
