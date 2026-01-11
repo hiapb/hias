@@ -1,12 +1,14 @@
 #!/bin/bash
 set -e
 if [ "$EUID" -ne 0 ]; then echo "请用 root 运行"; exit 1; fi
+
 SBOX_BIN="/usr/local/bin/sing-box"
 CONFIG_DIR="/etc/sing-box"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
 DB_FILE="${CONFIG_DIR}/ss_s5_list.db"
 SERVICE_FILE="/etc/systemd/system/sing-box.service"
 SCRIPT_PATH="$(realpath "$0")"
+
 mkdir -p "$CONFIG_DIR"
 touch "$DB_FILE"
 
@@ -34,10 +36,13 @@ install_sing_box(){
   chmod +x "$SBOX_BIN"
 }
 
+# 规则：DB 每行格式
+# ID|SS_PORT|SS_METHOD|SS_PASS|S5_SERVER|S5_PORT|S5_USER|S5_PASS
+# 若 S5_SERVER 为 "-" 表示 SS 直连（不走 S5）
 gen_config(){
   if [ ! -s "$DB_FILE" ]; then
     cat > "$CONFIG_FILE" <<EOF
-{"log":{"level":"info","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}]}
+{"log":{"level":"info","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct","rules":[]}}
 EOF
     return
   fi
@@ -53,9 +58,11 @@ EOF
     done < "$DB_FILE"
 
     echo -n '],"outbounds":['
+    # 只有有 S5_SERVER 的才生成 socks outbound
     first=1
     while IFS='|' read -r ID SS_PORT SS_METHOD SS_PASS S5_SERVER S5_PORT S5_USER S5_PASS; do
       [ -z "$ID" ] && continue
+      [ "$S5_SERVER" = "-" ] && continue
       if [ $first -eq 0 ]; then echo -n ','; fi
       first=0
       if [ "$S5_USER" != "-" ]; then
@@ -64,11 +71,17 @@ EOF
         echo -n '{"type":"socks","server":"'"$S5_SERVER"'","server_port":'"$S5_PORT"'","tag":"s5-'"$ID"'"}'
       fi
     done < "$DB_FILE"
-    echo -n ',{"type":"direct","tag":"direct"}],'
-    echo -n '"route":{"rules":['
+
+    # 永远追加 direct
+    if [ $first -eq 0 ]; then echo -n ','; fi
+    echo -n '{"type":"direct","tag":"direct"}],'
+
+    # route：只有有 S5 的才加规则；其他 inbound 自动 final=direct
+    echo -n '"route":{"final":"direct","rules":['
     first=1
     while IFS='|' read -r ID SS_PORT SS_METHOD SS_PASS S5_SERVER S5_PORT S5_USER S5_PASS; do
       [ -z "$ID" ] && continue
+      [ "$S5_SERVER" = "-" ] && continue
       if [ $first -eq 0 ]; then echo -n ','; fi
       first=0
       echo -n '{"inbound":["ss-'"$ID"'"],"outbound":"s5-'"$ID"'"}'
@@ -117,11 +130,52 @@ list_entries(){
     echo "当前无映射"
     return
   fi
-  echo "ID | SS端口 | 加密 | 密码 | S5地址:端口 | S5用户"
+  echo "ID | SS端口 | 加密 | 密码 | 模式 | S5地址:端口 | S5用户"
   while IFS='|' read -r ID SS_PORT SS_METHOD SS_PASS S5_SERVER S5_PORT S5_USER S5_PASS; do
     [ -z "$ID" ] && continue
-    echo "${ID} | ${SS_PORT} | ${SS_METHOD} | ${SS_PASS} | ${S5_SERVER}:${S5_PORT} | ${S5_USER}"
+    if [ "$S5_SERVER" = "-" ]; then
+      MODE="直连"
+      S5_SHOW="-"
+      S5U_SHOW="-"
+    else
+      MODE="S5"
+      S5_SHOW="${S5_SERVER}:${S5_PORT}"
+      S5U_SHOW="${S5_USER}"
+    fi
+    echo "${ID} | ${SS_PORT} | ${SS_METHOD} | ${SS_PASS} | ${MODE} | ${S5_SHOW} | ${S5U_SHOW}"
   done < "$DB_FILE"
+}
+
+add_ss_only(){
+  check_ready || return
+  echo "添加 SS（直连，不走 S5）"
+  read -p "SS 端口: " SS_PORT
+  [ -z "$SS_PORT" ] && { echo "端口不能为空"; return; }
+  if grep -q "|${SS_PORT}|" "$DB_FILE"; then
+    echo "该端口已存在映射"
+    return
+  fi
+  read -p "SS 密码: " SS_PASS
+  [ -z "$SS_PASS" ] && { echo "密码不能为空"; return; }
+  read -p "SS 加密方式(默认 aes-256-gcm): " SS_METHOD
+  SS_METHOD=${SS_METHOD:-aes-256-gcm}
+
+  if [ ! -s "$DB_FILE" ]; then
+    NEW_ID=1
+  else
+    NEW_ID=$(( $(awk -F'|' 'BEGIN{m=0}{if($1>m)m=$1}END{print m}' "$DB_FILE") + 1 ))
+  fi
+
+  echo "${NEW_ID}|${SS_PORT}|${SS_METHOD}|${SS_PASS}|-|0|-|-" >> "$DB_FILE"
+  gen_config
+  create_service
+
+  IP=$(hostname -I | awk '{print $1}')
+  echo "已添加（直连），客户端配置："
+  echo "服务器: ${IP}"
+  echo "端口: ${SS_PORT}"
+  echo "密码: ${SS_PASS}"
+  echo "加密: ${SS_METHOD}"
 }
 
 add_entry(){
@@ -155,7 +209,7 @@ add_entry(){
   gen_config
   create_service
   IP=$(hostname -I | awk '{print $1}')
-  echo "已添加，客户端配置："
+  echo "已添加（走S5），客户端配置："
   echo "服务器: ${IP}"
   echo "端口: ${SS_PORT}"
   echo "密码: ${SS_PASS}"
@@ -209,24 +263,26 @@ init_env(){
 main_menu(){
   while true; do
     echo
-    echo "===== 📎SS -> S5 管理菜单 ====="
+    echo "===== 📎SS 管理菜单 ====="
     echo "1) 安装"
     echo "2) 查看所有映射"
-    echo "3) 添加 SS -> S5"
-    echo "4) 删除映射"
-    echo "5) 查看服务状态"
-    echo "6) 查看日志"
-    echo "7) 卸载"
+    echo "3) 添加 SS"
+    echo "4) 添加 SS -> S5"
+    echo "5) 删除映射"
+    echo "6) 查看服务状态"
+    echo "7) 查看日志"
+    echo "8) 卸载"
     echo "0) 退出"
     read -p "选择: " CH
     case "$CH" in
       1) init_env ;;
       2) list_entries ;;
-      3) add_entry ;;
-      4) delete_entry ;;
-      5) check_ready && systemctl status sing-box --no-pager || true ;;
-      6) check_ready && journalctl -u sing-box -f || true ;;
-      7) uninstall_all ;;
+      3) add_ss_only ;;
+      4) add_entry ;;
+      5) delete_entry ;;
+      6) check_ready && systemctl status sing-box --no-pager || true ;;
+      7) check_ready && journalctl -u sing-box -f || true ;;
+      8) uninstall_all ;;
       0) exit 0 ;;
       *) echo "无效选择" ;;
     esac
