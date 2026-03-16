@@ -36,11 +36,11 @@ install_sing_box(){
   chmod +x "$SBOX_BIN"
 }
 
-# DB 每行格式：
-# ID|SS_PORT|SS_METHOD|SS_PASS|S5_SERVER|S5_PORT|S5_USER|S5_PASS
-# S5_SERVER 为 "-" 表示 SS 直连（不走 S5）
+# DB 复用格式解析：
+# ID | IN_PORT | PROTOCOL(原SS加密) | PASS | OUT_SERVER | OUT_PORT | OUT_USER | OUT_PASS
+# 当 PROTOCOL 为 socks 或 http 时，OUT_USER 作为入站账号，PASS 作为入站密码。
 gen_config(){
-  local ID DB_SS_PORT DB_SS_METHOD DB_SS_PASS DB_S5_SERVER DB_S5_PORT DB_S5_USER DB_S5_PASS
+  local ID IN_PORT PROTOCOL PASS OUT_SERVER OUT_PORT OUT_USER OUT_PASS
   local first
 
   if [ ! -s "$DB_FILE" ]; then
@@ -53,24 +53,36 @@ EOF
   {
     echo -n '{"log":{"level":"info","timestamp":true},"inbounds":['
     first=1
-    while IFS='|' read -r ID DB_SS_PORT DB_SS_METHOD DB_SS_PASS DB_S5_SERVER DB_S5_PORT DB_S5_USER DB_S5_PASS; do
+    while IFS='|' read -r ID IN_PORT PROTOCOL PASS OUT_SERVER OUT_PORT OUT_USER OUT_PASS; do
       [ -z "$ID" ] && continue
       if [ $first -eq 0 ]; then echo -n ','; fi
       first=0
-      echo -n '{"type":"shadowsocks","tag":"ss-'"$ID"'","listen":"::","listen_port":'"$DB_SS_PORT"',"method":"'"$DB_SS_METHOD"'","password":"'"$DB_SS_PASS"'"}'
+      
+      # 动态生成不同类型的 Inbound
+      if [ "$PROTOCOL" = "socks" ] || [ "$PROTOCOL" = "http" ]; then
+        echo -n '{"type":"'"$PROTOCOL"'","tag":"in-'"$ID"'","listen":"::","listen_port":'"$IN_PORT"
+        if [ "$OUT_USER" != "-" ]; then
+          echo -n ',"users":[{"username":"'"$OUT_USER"'","password":"'"$PASS"'"}]'
+        fi
+        echo -n '}'
+      else
+        # 默认 SS 逻辑
+        echo -n '{"type":"shadowsocks","tag":"in-'"$ID"'","listen":"::","listen_port":'"$IN_PORT"',"method":"'"$PROTOCOL"'","password":"'"$PASS"'"}'
+      fi
     done < "$DB_FILE"
 
     echo -n '],"outbounds":['
     first=1
-    while IFS='|' read -r ID DB_SS_PORT DB_SS_METHOD DB_SS_PASS DB_S5_SERVER DB_S5_PORT DB_S5_USER DB_S5_PASS; do
+    while IFS='|' read -r ID IN_PORT PROTOCOL PASS OUT_SERVER OUT_PORT OUT_USER OUT_PASS; do
       [ -z "$ID" ] && continue
-      [ "$DB_S5_SERVER" = "-" ] && continue
+      [ "$OUT_SERVER" = "-" ] && continue
       if [ $first -eq 0 ]; then echo -n ','; fi
       first=0
-      if [ "$DB_S5_USER" != "-" ]; then
-        echo -n '{"type":"socks","server":"'"$DB_S5_SERVER"'","server_port":'"$DB_S5_PORT"',"username":"'"$DB_S5_USER"'","password":"'"$DB_S5_PASS"'","tag":"s5-'"$ID"'"}'
+      if [ "$OUT_USER" != "-" ] && [ "$PROTOCOL" != "socks" ] && [ "$PROTOCOL" != "http" ]; then
+        # 只有在非纯入口模式下，才将 OUT_USER 解析为 S5 出口的认证信息
+        echo -n '{"type":"socks","server":"'"$OUT_SERVER"'","server_port":'"$OUT_PORT"',"username":"'"$OUT_USER"'","password":"'"$OUT_PASS"'","tag":"s5-'"$ID"'"}'
       else
-        echo -n '{"type":"socks","server":"'"$DB_S5_SERVER"'","server_port":'"$DB_S5_PORT"'","tag":"s5-'"$ID"'"}'
+        echo -n '{"type":"socks","server":"'"$OUT_SERVER"'","server_port":'"$OUT_PORT"'","tag":"s5-'"$ID"'"}'
       fi
     done < "$DB_FILE"
 
@@ -79,12 +91,12 @@ EOF
 
     echo -n '"route":{"final":"direct","rules":['
     first=1
-    while IFS='|' read -r ID DB_SS_PORT DB_SS_METHOD DB_SS_PASS DB_S5_SERVER DB_S5_PORT DB_S5_USER DB_S5_PASS; do
+    while IFS='|' read -r ID IN_PORT PROTOCOL PASS OUT_SERVER OUT_PORT OUT_USER OUT_PASS; do
       [ -z "$ID" ] && continue
-      [ "$DB_S5_SERVER" = "-" ] && continue
+      [ "$OUT_SERVER" = "-" ] && continue
       if [ $first -eq 0 ]; then echo -n ','; fi
       first=0
-      echo -n '{"inbound":["ss-'"$ID"'"],"outbound":"s5-'"$ID"'"}'
+      echo -n '{"inbound":["in-'"$ID"'"],"outbound":"s5-'"$ID"'"}'
     done < "$DB_FILE"
     echo ']}}'
   } > "$CONFIG_FILE"
@@ -130,76 +142,68 @@ list_entries(){
     echo "当前无映射"
     return
   fi
-  echo "ID | SS端口 | 加密 | 密码 | 模式 | S5地址:端口 | S5用户"
-  while IFS='|' read -r ID SS_PORT SS_METHOD SS_PASS S5_SERVER S5_PORT S5_USER S5_PASS; do
+  echo "ID | 端口 | 入站协议 | 入站认证信息 | 出站模式 | 出站目标"
+  echo "------------------------------------------------------------------------"
+  while IFS='|' read -r ID IN_PORT PROTOCOL PASS OUT_SERVER OUT_PORT OUT_USER OUT_PASS; do
     [ -z "$ID" ] && continue
-    if [ "$S5_SERVER" = "-" ]; then
-      MODE="直连"
-      S5_SHOW="-"
-      S5U_SHOW="-"
+
+    # 解析入站
+    if [ "$PROTOCOL" = "socks" ] || [ "$PROTOCOL" = "http" ]; then
+      IN_PROTO=$(echo "$PROTOCOL" | tr 'a-z' 'A-Z')
+      if [ "$OUT_USER" = "-" ]; then
+        IN_AUTH="无认证(高危)"
+      else
+        IN_AUTH="${OUT_USER}"
+      fi
     else
-      MODE="S5"
-      S5_SHOW="${S5_SERVER}:${S5_PORT}"
-      S5U_SHOW="${S5_USER}"
+      IN_PROTO="SS"
+      IN_AUTH="${PROTOCOL}" # SS显示加密方式
     fi
-    echo "${ID} | ${SS_PORT} | ${SS_METHOD} | ${SS_PASS} | ${MODE} | ${S5_SHOW} | ${S5U_SHOW}"
+
+    # 解析出站
+    if [ "$OUT_SERVER" = "-" ]; then
+      OUT_MODE="直连"
+      OUT_DEST="-"
+    else
+      OUT_MODE="走S5"
+      OUT_DEST="${OUT_SERVER}:${OUT_PORT}"
+    fi
+
+    echo "${ID} | ${IN_PORT} | ${IN_PROTO} | ${IN_AUTH} | ${OUT_MODE} | ${OUT_DEST}"
   done < "$DB_FILE"
 }
 
 add_ss_only(){
   check_ready || return
-  echo "添加 SS（直连，不走 S5）"
+  echo ">>> 添加 SS（直连出口）"
   read -p "SS 端口: " SS_PORT
   [ -z "$SS_PORT" ] && { echo "端口不能为空"; return; }
-  if grep -q "|${SS_PORT}|" "$DB_FILE"; then
-    echo "该端口已存在"
-    return
-  fi
+  if grep -q "|${SS_PORT}|" "$DB_FILE"; then echo "该端口已存在"; return; fi
   read -p "SS 密码: " SS_PASS
   [ -z "$SS_PASS" ] && { echo "密码不能为空"; return; }
   read -p "SS 加密方式(默认 aes-256-gcm): " SS_METHOD
   SS_METHOD=${SS_METHOD:-aes-256-gcm}
 
-  if [ ! -s "$DB_FILE" ]; then
-    NEW_ID=1
-  else
-    NEW_ID=$(( $(awk -F'|' 'BEGIN{m=0}{if($1>m)m=$1}END{print m}' "$DB_FILE") + 1 ))
-  fi
-
+  NEW_ID=$(get_next_id)
   echo "${NEW_ID}|${SS_PORT}|${SS_METHOD}|${SS_PASS}|-|0|-|-" >> "$DB_FILE"
-
-  SHOW_PORT="$SS_PORT"
-  SHOW_PASS="$SS_PASS"
-  SHOW_METHOD="$SS_METHOD"
-
-  gen_config
-  create_service
-
-  IP=$(hostname -I | awk '{print $1}')
-  echo "已添加（直连），客户端配置："
-  echo "服务器: ${IP}"
-  echo "端口: ${SHOW_PORT}"
-  echo "密码: ${SHOW_PASS}"
-  echo "加密: ${SHOW_METHOD}"
+  
+  gen_and_reload "SS" "$SS_PORT" "" "$SS_METHOD" "$SS_PASS"
 }
 
-add_entry(){
+add_ss_to_s5(){
   check_ready || return
-  echo "添加 SS -> S5 映射"
+  echo ">>> 添加 SS -> S5 级联"
   read -p "SS 端口: " SS_PORT
   [ -z "$SS_PORT" ] && { echo "端口不能为空"; return; }
-  if grep -q "|${SS_PORT}|" "$DB_FILE"; then
-    echo "该端口已存在映射"
-    return
-  fi
+  if grep -q "|${SS_PORT}|" "$DB_FILE"; then echo "该端口已存在"; return; fi
   read -p "SS 密码: " SS_PASS
   [ -z "$SS_PASS" ] && { echo "密码不能为空"; return; }
   read -p "SS 加密方式(默认 aes-256-gcm): " SS_METHOD
   SS_METHOD=${SS_METHOD:-aes-256-gcm}
 
-  read -p "S5 地址: " S5_SERVER
-  read -p "S5 端口: " S5_PORT
-  read -p "S5 是否需要认证?(y/n): " A
+  read -p "S5 目标地址(IP): " S5_SERVER
+  read -p "S5 目标端口: " S5_PORT
+  read -p "S5 目标是否需要认证?(y/n): " A
   S5_USER="-"
   S5_PASSW="-"
   if [ "$A" = "y" ] || [ "$A" = "Y" ]; then
@@ -207,62 +211,95 @@ add_entry(){
     read -p "S5 密码: " S5_PASSW
   fi
 
-  if [ ! -s "$DB_FILE" ]; then
-    NEW_ID=1
+  NEW_ID=$(get_next_id)
+  echo "${NEW_ID}|${SS_PORT}|${SS_METHOD}|${SS_PASS}|${S5_SERVER}|${S5_PORT}|${S5_USER}|${S5_PASSW}" >> "$DB_FILE"
+  
+  gen_and_reload "SS -> S5" "$SS_PORT" "" "$SS_METHOD" "$SS_PASS"
+}
+
+add_direct_inbound(){
+  local PROTO=$1
+  check_ready || return
+  echo ">>> 添加 ${PROTO^^} 单协议节点（直连出口）"
+  echo "警告：暴露未经 TLS 加密的 ${PROTO^^} 端口到公网有极高的被探测和封锁风险。"
+  
+  read -p "${PROTO^^} 监听端口: " IN_PORT
+  [ -z "$IN_PORT" ] && { echo "端口不能为空"; return; }
+  if grep -q "|${IN_PORT}|" "$DB_FILE"; then echo "该端口已存在"; return; fi
+
+  read -p "是否需要账号密码认证? [强烈建议选y] (y/n): " A
+  local USER="-"
+  local PASS="-"
+  if [ "$A" = "y" ] || [ "$A" = "Y" ]; then
+    read -p "认证用户名: " USER
+    [ -z "$USER" ] && USER="admin"
+    read -p "认证密  码: " PASS
+    [ -z "$PASS" ] && PASS="123456"
   else
-    NEW_ID=$(( $(awk -F'|' 'BEGIN{m=0}{if($1>m)m=$1}END{print m}' "$DB_FILE") + 1 ))
+    echo "注意：您选择了无认证模式，任何知道该 IP:Port 的人均可使用您的流量。"
   fi
 
-  echo "${NEW_ID}|${SS_PORT}|${SS_METHOD}|${SS_PASS}|${S5_SERVER}|${S5_PORT}|${S5_USER}|${S5_PASSW}" >> "$DB_FILE"
+  NEW_ID=$(get_next_id)
+  # 结构: ID | 端口 | 协议(socks/http) | 入站密码 | 出站地址(-) | 出站端口(0) | 入站用户 | 出站密码(-)
+  echo "${NEW_ID}|${IN_PORT}|${PROTO}|${PASS}|-|0|${USER}|-" >> "$DB_FILE"
+  
+  gen_and_reload "${PROTO^^}" "$IN_PORT" "$USER" "" "$PASS"
+}
 
-  SHOW_PORT="$SS_PORT"
-  SHOW_PASS="$SS_PASS"
-  SHOW_METHOD="$SS_METHOD"
+get_next_id(){
+  if [ ! -s "$DB_FILE" ]; then
+    echo 1
+  else
+    awk -F'|' 'BEGIN{m=0}{if($1>m)m=$1}END{print m+1}' "$DB_FILE"
+  fi
+}
+
+gen_and_reload(){
+  local TYPE=$1
+  local PORT=$2
+  local USER=$3
+  local METHOD=$4
+  local PASS=$5
 
   gen_config
   create_service
 
   IP=$(hostname -I | awk '{print $1}')
-  echo "已添加（走S5），客户端配置："
-  echo "服务器: ${IP}"
-  echo "端口: ${SHOW_PORT}"
-  echo "密码: ${SHOW_PASS}"
-  echo "加密: ${SHOW_METHOD}"
+  echo "====================================="
+  echo "✅ 已成功添加 ${TYPE} 节点，客户端配置："
+  echo "服务器 IP : ${IP}"
+  echo "连接端口  : ${PORT}"
+  
+  if [ -n "$METHOD" ]; then echo "加密方式  : ${METHOD}"; fi
+  if [ "$USER" != "-" ] && [ -n "$USER" ]; then echo "用 户 名  : ${USER}"; fi
+  if [ "$PASS" != "-" ] && [ -n "$PASS" ]; then echo "密    码  : ${PASS}"; fi
+  if [ "$USER" = "-" ]; then echo "安全警告  : 当前未开启用户认证！"; fi
+  echo "====================================="
 }
 
 delete_entry(){
   check_ready || return
-  if [ ! -s "$DB_FILE" ]; then
-    echo "当前无映射"
-    return
-  fi
+  if [ ! -s "$DB_FILE" ]; then echo "当前无映射"; return; fi
   list_entries
   read -p "输入要删除的 ID: " D
   [ -z "$D" ] && { echo "已取消"; return; }
-  if ! grep -q "^${D}|" "$DB_FILE"; then
-    echo "未找到该 ID"
-    return
-  fi
+  if ! grep -q "^${D}|" "$DB_FILE"; then echo "未找到该 ID"; return; fi
   sed -i "/^${D}|/d" "$DB_FILE"
   gen_config
   create_service
-  echo "已删除 ID=${D} 并重启 sing-box"
+  echo "已删除 ID=${D} 并平滑重载 sing-box"
 }
 
 uninstall_all(){
-  read -p "确认卸载 sing-box 并删除本脚本?(y/n): " C
-  if [ "$C" != "y" ] && [ "$C" != "Y" ]; then
-    echo "已取消"
-    return
-  fi
+  read -p "确认彻底卸载 sing-box 并删除所有配置?(y/n): " C
+  if [ "$C" != "y" ] && [ "$C" != "Y" ]; then echo "已取消"; return; fi
   systemctl stop sing-box 2>/dev/null || true
   systemctl disable sing-box 2>/dev/null || true
   rm -f "$SERVICE_FILE"
   systemctl daemon-reload
   rm -rf "$CONFIG_DIR"
-  rm -f "$SBOX_BIN"
-  rm -f "$SCRIPT_PATH"
-  echo "已卸载 sing-box、配置和脚本自身"
+  rm -f "$SBOX_BIN" "$SCRIPT_PATH"
+  echo "清理完毕。"
   exit 0
 }
 
@@ -271,34 +308,40 @@ init_env(){
   install_sing_box
   gen_config
   create_service
-  echo "初始化完成"
+  echo "初始化与内核编译已就绪。"
 }
 
 main_menu(){
   while true; do
     echo
-    echo "===== 📎SS 管理菜单 ====="
+    echo "===== 📎 多协议安全网关管理台 ====="
     echo "1) 安装"
-    echo "2) 查看所有SS"
+    echo "2) 查看所有节点状态"
+    echo "-----------------------------------"
     echo "3) 添加 SS"
     echo "4) 添加 SS -> S5"
-    echo "5) 删除SS"
-    echo "6) 查看服务状态"
-    echo "7) 查看日志"
-    echo "8) 卸载"
+    echo "5) 添加 SOCKS5"
+    echo "6) 添加 HTTP"
+    echo "-----------------------------------"
+    echo "7) 删除特定节点"
+    echo "8) 查看底层服务状态"
+    echo "9) 追踪实时运行日志"
+    echo "10)彻底卸载"
     echo "0) 退出"
     read -p "选择: " CH
     case "$CH" in
       1) init_env ;;
       2) list_entries ;;
       3) add_ss_only ;;
-      4) add_entry ;;
-      5) delete_entry ;;
-      6) check_ready && systemctl status sing-box --no-pager || true ;;
-      7) check_ready && journalctl -u sing-box -f || true ;;
-      8) uninstall_all ;;
+      4) add_ss_to_s5 ;;
+      5) add_direct_inbound "socks" ;;
+      6) add_direct_inbound "http" ;;
+      7) delete_entry ;;
+      8) check_ready && systemctl status sing-box --no-pager || true ;;
+      9) check_ready && journalctl -u sing-box -f || true ;;
+      10) uninstall_all ;;
       0) exit 0 ;;
-      *) echo "无效选择" ;;
+      *) echo "无效指令" ;;
     esac
   done
 }
