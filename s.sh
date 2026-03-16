@@ -221,7 +221,6 @@ add_direct_inbound(){
   local PROTO=$1
   check_ready || return
   echo ">>> 添加 ${PROTO^^} 单协议节点（直连出口）"
-  echo "警告：暴露未经 TLS 加密的 ${PROTO^^} 端口到公网有极高的被探测和封锁风险。"
   
   read -p "${PROTO^^} 监听端口: " IN_PORT
   [ -z "$IN_PORT" ] && { echo "端口不能为空"; return; }
