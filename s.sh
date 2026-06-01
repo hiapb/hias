@@ -37,10 +37,10 @@ install_sing_box(){
 }
 
 # DB 复用格式解析：
-# ID | IN_PORT | PROTOCOL(原SS加密) | PASS | OUT_SERVER | OUT_PORT | OUT_USER | OUT_PASS
+# ID | IN_PORT | PROTOCOL(原SS加密) | PASS | OUT_SERVER | OUT_PORT | OUT_USER | OUT_PASS | OUT_PROTO(可选, http或socks, 默认socks)
 # 当 PROTOCOL 为 socks 或 http 时，OUT_USER 作为入站账号，PASS 作为入站密码。
 gen_config(){
-  local ID IN_PORT PROTOCOL PASS OUT_SERVER OUT_PORT OUT_USER OUT_PASS
+  local ID IN_PORT PROTOCOL PASS OUT_SERVER OUT_PORT OUT_USER OUT_PASS OUT_PROTO
   local first
 
   if [ ! -s "$DB_FILE" ]; then
@@ -53,7 +53,7 @@ EOF
   {
     echo -n '{"log":{"level":"info","timestamp":true},"inbounds":['
     first=1
-    while IFS='|' read -r ID IN_PORT PROTOCOL PASS OUT_SERVER OUT_PORT OUT_USER OUT_PASS; do
+    while IFS='|' read -r ID IN_PORT PROTOCOL PASS OUT_SERVER OUT_PORT OUT_USER OUT_PASS OUT_PROTO; do
       [ -z "$ID" ] && continue
       if [ $first -eq 0 ]; then echo -n ','; fi
       first=0
@@ -73,16 +73,21 @@ EOF
 
     echo -n '],"outbounds":['
     first=1
-    while IFS='|' read -r ID IN_PORT PROTOCOL PASS OUT_SERVER OUT_PORT OUT_USER OUT_PASS; do
+    while IFS='|' read -r ID IN_PORT PROTOCOL PASS OUT_SERVER OUT_PORT OUT_USER OUT_PASS OUT_PROTO; do
       [ -z "$ID" ] && continue
       [ "$OUT_SERVER" = "-" ] && continue
       if [ $first -eq 0 ]; then echo -n ','; fi
       first=0
+      
+      # 识别出站协议，默认为 socks
+      local ACTUAL_OUT_PROTO="${OUT_PROTO:-socks}"
+      ACTUAL_OUT_PROTO=$(echo "$ACTUAL_OUT_PROTO" | tr -d '\r') # 清理可能的回车符
+
       if [ "$OUT_USER" != "-" ] && [ "$PROTOCOL" != "socks" ] && [ "$PROTOCOL" != "http" ]; then
-        # 只有在非纯入口模式下，才将 OUT_USER 解析为 S5 出口的认证信息
-        echo -n '{"type":"socks","server":"'"$OUT_SERVER"'","server_port":'"$OUT_PORT"',"username":"'"$OUT_USER"'","password":"'"$OUT_PASS"'","tag":"s5-'"$ID"'"}'
+        # 只有在非纯入口模式下，才将 OUT_USER 解析为 S5/HTTP 出口的认证信息
+        echo -n '{"type":"'"$ACTUAL_OUT_PROTO"'","server":"'"$OUT_SERVER"'","server_port":'"$OUT_PORT"',"username":"'"$OUT_USER"'","password":"'"$OUT_PASS"'","tag":"s5-'"$ID"'"}'
       else
-        echo -n '{"type":"socks","server":"'"$OUT_SERVER"'","server_port":'"$OUT_PORT"'","tag":"s5-'"$ID"'"}'
+        echo -n '{"type":"'"$ACTUAL_OUT_PROTO"'","server":"'"$OUT_SERVER"'","server_port":'"$OUT_PORT"'","tag":"s5-'"$ID"'"}'
       fi
     done < "$DB_FILE"
 
@@ -91,7 +96,7 @@ EOF
 
     echo -n '"route":{"final":"direct","rules":['
     first=1
-    while IFS='|' read -r ID IN_PORT PROTOCOL PASS OUT_SERVER OUT_PORT OUT_USER OUT_PASS; do
+    while IFS='|' read -r ID IN_PORT PROTOCOL PASS OUT_SERVER OUT_PORT OUT_USER OUT_PASS OUT_PROTO; do
       [ -z "$ID" ] && continue
       [ "$OUT_SERVER" = "-" ] && continue
       if [ $first -eq 0 ]; then echo -n ','; fi
@@ -144,7 +149,7 @@ list_entries(){
   fi
   echo "ID | 端口 | 入站协议 | 入站认证信息 | 出站模式 | 出站目标"
   echo "------------------------------------------------------------------------"
-  while IFS='|' read -r ID IN_PORT PROTOCOL PASS OUT_SERVER OUT_PORT OUT_USER OUT_PASS; do
+  while IFS='|' read -r ID IN_PORT PROTOCOL PASS OUT_SERVER OUT_PORT OUT_USER OUT_PASS OUT_PROTO; do
     [ -z "$ID" ] && continue
 
     # 解析入站
@@ -165,7 +170,12 @@ list_entries(){
       OUT_MODE="直连"
       OUT_DEST="-"
     else
-      OUT_MODE="走S5"
+      local OUT_P=$(echo "${OUT_PROTO:-socks}" | tr -d '\r')
+      if [ "$OUT_P" = "http" ]; then
+        OUT_MODE="走HTTP"
+      else
+        OUT_MODE="走S5"
+      fi
       OUT_DEST="${OUT_SERVER}:${OUT_PORT}"
     fi
 
@@ -212,9 +222,37 @@ add_ss_to_s5(){
   fi
 
   NEW_ID=$(get_next_id)
-  echo "${NEW_ID}|${SS_PORT}|${SS_METHOD}|${SS_PASS}|${S5_SERVER}|${S5_PORT}|${S5_USER}|${S5_PASSW}" >> "$DB_FILE"
+  echo "${NEW_ID}|${SS_PORT}|${SS_METHOD}|${SS_PASS}|${S5_SERVER}|${S5_PORT}|${S5_USER}|${S5_PASSW}|socks" >> "$DB_FILE"
   
   gen_and_reload "SS -> S5" "$SS_PORT" "" "$SS_METHOD" "$SS_PASS"
+}
+
+add_ss_to_http(){
+  check_ready || return
+  echo ">>> 添加 SS -> HTTP 级联"
+  read -p "SS 端口: " SS_PORT
+  [ -z "$SS_PORT" ] && { echo "端口不能为空"; return; }
+  if grep -q "|${SS_PORT}|" "$DB_FILE"; then echo "该端口已存在"; return; fi
+  read -p "SS 密码: " SS_PASS
+  [ -z "$SS_PASS" ] && { echo "密码不能为空"; return; }
+  read -p "SS 加密方式(默认 aes-256-gcm): " SS_METHOD
+  SS_METHOD=${SS_METHOD:-aes-256-gcm}
+
+  read -p "HTTP 目标地址(IP): " HTTP_SERVER
+  read -p "HTTP 目标端口: " HTTP_PORT
+  read -p "HTTP 目标是否需要认证?(y/n): " A
+  HTTP_USER="-"
+  HTTP_PASSW="-"
+  if [ "$A" = "y" ] || [ "$A" = "Y" ]; then
+    read -p "HTTP 用户: " HTTP_USER
+    read -p "HTTP 密码: " HTTP_PASSW
+  fi
+
+  NEW_ID=$(get_next_id)
+  # 注意：结尾写了 http 作为隐藏协议标识
+  echo "${NEW_ID}|${SS_PORT}|${SS_METHOD}|${SS_PASS}|${HTTP_SERVER}|${HTTP_PORT}|${HTTP_USER}|${HTTP_PASSW}|http" >> "$DB_FILE"
+  
+  gen_and_reload "SS -> HTTP" "$SS_PORT" "" "$SS_METHOD" "$SS_PASS"
 }
 
 add_direct_inbound(){
@@ -239,8 +277,8 @@ add_direct_inbound(){
   fi
 
   NEW_ID=$(get_next_id)
-  # 结构: ID | 端口 | 协议(socks/http) | 入站密码 | 出站地址(-) | 出站端口(0) | 入站用户 | 出站密码(-)
-  echo "${NEW_ID}|${IN_PORT}|${PROTO}|${PASS}|-|0|${USER}|-" >> "$DB_FILE"
+  # 结构: ID | 端口 | 协议(socks/http) | 入站密码 | 出站地址(-) | 出站端口(0) | 入站用户 | 出站密码(-) | 默认协议
+  echo "${NEW_ID}|${IN_PORT}|${PROTO}|${PASS}|-|0|${USER}|-|-" >> "$DB_FILE"
   
   gen_and_reload "${PROTO^^}" "$IN_PORT" "$USER" "" "$PASS"
 }
@@ -319,13 +357,14 @@ main_menu(){
     echo "-----------------------------------"
     echo "3) 添加 SS"
     echo "4) 添加 SS -> S5"
-    echo "5) 添加 SOCKS5"
-    echo "6) 添加 HTTP"
+    echo "5) 添加 SS -> HTTP"
+    echo "6) 添加 SOCKS5"
+    echo "7) 添加 HTTP"
     echo "-----------------------------------"
-    echo "7) 删除特定节点"
-    echo "8) 查看底层服务状态"
-    echo "9) 追踪实时运行日志"
-    echo "10)彻底卸载"
+    echo "8) 删除特定节点"
+    echo "9) 查看底层服务状态"
+    echo "10)追踪实时运行日志"
+    echo "11)彻底卸载"
     echo "0) 退出"
     read -p "选择: " CH
     case "$CH" in
@@ -333,12 +372,13 @@ main_menu(){
       2) list_entries ;;
       3) add_ss_only ;;
       4) add_ss_to_s5 ;;
-      5) add_direct_inbound "socks" ;;
-      6) add_direct_inbound "http" ;;
-      7) delete_entry ;;
-      8) check_ready && systemctl status sing-box --no-pager || true ;;
-      9) check_ready && journalctl -u sing-box -f || true ;;
-      10) uninstall_all ;;
+      5) add_ss_to_http ;;
+      6) add_direct_inbound "socks" ;;
+      7) add_direct_inbound "http" ;;
+      8) delete_entry ;;
+      9) check_ready && systemctl status sing-box --no-pager || true ;;
+      10) check_ready && journalctl -u sing-box -f || true ;;
+      11) uninstall_all ;;
       0) exit 0 ;;
       *) echo "无效指令" ;;
     esac
